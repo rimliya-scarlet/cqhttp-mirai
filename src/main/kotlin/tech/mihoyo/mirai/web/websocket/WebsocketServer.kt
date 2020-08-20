@@ -11,43 +11,50 @@ import io.ktor.server.engine.ApplicationEngine
 import io.ktor.server.engine.applicationEngineEnvironment
 import io.ktor.server.engine.connector
 import io.ktor.server.engine.embeddedServer
-import io.ktor.util.KtorExperimentalAPI
-import io.ktor.util.pipeline.*
 import io.ktor.websocket.*
 import io.ktor.websocket.WebSockets
-import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.SendChannel
 import kotlinx.coroutines.channels.consumeEach
+import net.mamoe.mirai.console.plugins.ToBeRemoved
 import net.mamoe.mirai.event.events.BotEvent
 import net.mamoe.mirai.event.subscribeAlways
+import net.mamoe.mirai.utils.currentTimeMillis
 import tech.mihoyo.mirai.BotSession
+import tech.mihoyo.mirai.data.common.CQHeartbeatMetaEventDTO
 import tech.mihoyo.mirai.data.common.CQIgnoreEventDTO
+import tech.mihoyo.mirai.data.common.CQPluginStatusData
 import tech.mihoyo.mirai.data.common.toCQDTO
 import tech.mihoyo.mirai.util.logger
 import tech.mihoyo.mirai.util.toJson
 
-@ExperimentalCoroutinesApi
-@KtorExperimentalAPI
+@OptIn(ToBeRemoved::class)
 class WebSocketServer(
     val session: BotSession
 ) {
     lateinit var server: ApplicationEngine
-    private var serviceConfig = WebSocketServerServiceConfig(session.config.getConfigSection("ws"))
+    private lateinit var serviceConfig: WebSocketServerServiceConfig
 
     init {
-        logger.info("Bot: ${session.bot.id} 正向Websocket服务端是否配置开启: ${serviceConfig.enable}")
-        if (serviceConfig.enable) {
-            try {
-                server = embeddedServer(CIO, environment = applicationEngineEnvironment {
-                    this.module { cqWebsocketServer(session, serviceConfig) }
-                    connector {
-                        this.host = serviceConfig.wsHost
-                        this.port = serviceConfig.wsPort
-                    }
-                })
-                server.start(false)
-            } catch (e: Exception) {
-                logger.error("Bot:${session.bot.id} Websocket服务端模块启用失败")
+        if (session.config.exist("ws")) {
+            serviceConfig = WebSocketServerServiceConfig(session.config.getConfigSection("ws"))
+            logger.info("Bot: ${session.bot.id} 正向Websocket服务端是否配置开启: ${serviceConfig.enable}")
+            if (serviceConfig.enable) {
+                try {
+                    server = embeddedServer(CIO, environment = applicationEngineEnvironment {
+                        this.module { cqWebsocketServer(session, serviceConfig) }
+                        connector {
+                            this.host = serviceConfig.wsHost
+                            this.port = serviceConfig.wsPort
+                        }
+                    })
+                    server.start(false)
+                } catch (e: Exception) {
+                    logger.error("Bot:${session.bot.id} Websocket服务端模块启用失败")
+                }
             }
+        } else {
+            logger.debug("${session.bot.id}未对ws进行配置")
         }
     }
 
@@ -57,7 +64,7 @@ class WebSocketServer(
 
 }
 
-@ExperimentalCoroutinesApi
+@OptIn(ExperimentalCoroutinesApi::class)
 fun Application.cqWebsocketServer(session: BotSession, serviceConfig: WebSocketServerServiceConfig) {
     logger.debug("Bot: ${session.bot.id} 尝试开启正向Websocket服务端于端口: ${serviceConfig.wsPort}")
     install(DefaultHeaders)
@@ -72,22 +79,29 @@ fun Application.cqWebsocketServer(session: BotSession, serviceConfig: WebSocketS
                     send(Frame.Text(this.toJson()))
                 }
             }
+
+            val heartbeatJob = if (session.heartbeatEnabled) emitHeartbeat(session, outgoing) else null
+
             try {
-                for (frame in incoming) {
-                    outgoing.send(frame)
-                }
+                incoming.consumeEach {}
             } finally {
+                logger.info("Bot: ${session.bot.id} 正向Websocket服务端 /event 连接被关闭")
                 listener.complete()
+                heartbeatJob?.cancel()
             }
         }
         cqWebsocket("/api", session, serviceConfig) {
-            logger.debug("Bot: ${session.bot.id} 正向Websocket服务端 /api 开始处理API请求")
-            incoming.consumeEach {
-                when (it) {
-                    is Frame.Text -> {
-                        handleWebSocketActions(outgoing, session.cqApiImpl, it.readText())
+            try {
+                logger.debug("Bot: ${session.bot.id} 正向Websocket服务端 /api 开始处理API请求")
+                incoming.consumeEach {
+                    when (it) {
+                        is Frame.Text -> {
+                            handleWebSocketActions(outgoing, session.cqApiImpl, it.readText())
+                        }
                     }
                 }
+            } finally {
+                logger.info("Bot: ${session.bot.id} 正向Websocket服务端 /api 连接被关闭")
             }
         }
         cqWebsocket("/", session, serviceConfig) { _session ->
@@ -97,26 +111,49 @@ fun Application.cqWebsocketServer(session: BotSession, serviceConfig: WebSocketS
                     send(Frame.Text(this.toJson()))
                 }
             }
+
+            val heartbeatJob = if (session.heartbeatEnabled) emitHeartbeat(session, outgoing) else null
+
             try {
-                for (frame in incoming) {
-                    outgoing.send(frame)
-                }
-            } finally {
-                listener.complete()
-            }
-            logger.debug("Bot: ${session.bot.id} 正向Websocket服务端 / 开始处理API请求")
-            incoming.consumeEach {
-                when (it) {
-                    is Frame.Text -> {
-                        handleWebSocketActions(outgoing, session.cqApiImpl, it.readText())
+                logger.debug("Bot: ${session.bot.id} 正向Websocket服务端 / 开始处理API请求")
+                incoming.consumeEach {
+                    when (it) {
+                        is Frame.Text -> {
+                            handleWebSocketActions(outgoing, session.cqApiImpl, it.readText())
+                        }
                     }
                 }
+            } finally {
+                logger.debug("Bot: ${session.bot.id} 正向Websocket服务端 / 连接被关闭")
+                listener.complete()
+                heartbeatJob?.cancel()
             }
         }
     }
 }
 
-@ContextDsl
+private suspend fun emitHeartbeat(session: BotSession, outgoing: SendChannel<Frame>): Job {
+    return GlobalScope.launch {
+        while (true) {
+            outgoing.send(
+                Frame.Text(
+                    CQHeartbeatMetaEventDTO(
+                        session.botId,
+                        currentTimeMillis,
+                        CQPluginStatusData(
+                            good = session.bot.isOnline,
+                            plugins_good = session.bot.isOnline,
+                            online = session.bot.isOnline
+                        )
+                    ).toJson()
+                )
+            )
+            delay(session.heartbeatInterval)
+        }
+    }
+}
+
+
 private inline fun Route.cqWebsocket(
     path: String,
     session: BotSession,

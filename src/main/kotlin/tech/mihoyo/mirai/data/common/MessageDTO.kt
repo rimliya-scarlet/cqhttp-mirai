@@ -10,14 +10,19 @@
 package tech.mihoyo.mirai.data.common
 
 import kotlinx.serialization.*
-import kotlinx.serialization.builtins.list
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.builtins.serializer
-import tech.mihoyo.mirai.coolq.api.http.util.PokeMap
+import kotlinx.serialization.descriptors.SerialDescriptor
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.Encoder
+import tech.mihoyo.mirai.util.PokeMap
 import net.mamoe.mirai.contact.Contact
 import net.mamoe.mirai.contact.Group
 import net.mamoe.mirai.message.*
 import net.mamoe.mirai.message.data.*
+import net.mamoe.mirai.utils.MiraiExperimentalAPI
 import net.mamoe.mirai.utils.currentTimeMillis
+import tech.mihoyo.mirai.util.toCQString
 import java.net.URL
 
 /*
@@ -60,26 +65,6 @@ data class CQPrivateMessagePacketDTO(
     override var post_type: String = "message"
     val message_type: String = "private"
 }
-
-
-// Message toCQString
-suspend fun Message.toCQString(): String {
-    return when (this) {
-        is PlainText -> content
-        is At -> "[CQ:at,qq=$target]"
-        is Face -> "[CQ:face,id=$id]"
-        is PokeMessage -> "[CQ:shake]"
-        is AtAll -> "[CQ:at,qq=all]"
-        is Image -> {
-            "[CQ:image,file=$imageId,url=${queryUrl()}]"
-        }
-        is RichMessage -> "[CQ:rich,data=${content}]"
-        is MessageSource -> ""
-        is QuoteReply -> ""
-        else -> "此处消息的转义尚未被插件支持"
-    }
-}
-
 
 // Message DTO
 @Serializable
@@ -172,7 +157,6 @@ sealed class CQMessageChainOrStringDTO {
             error("Not implemented")
         }
 
-        @OptIn(UnstableDefault::class)
         override fun serialize(encoder: Encoder, value: CQMessageChainOrStringDTO) {
             when (value) {
                 is WrappedCQMessageChainString -> {
@@ -216,9 +200,8 @@ data class WrappedCQMessageChainList(
             error("Not implemented")
         }
 
-        @OptIn(UnstableDefault::class)
         override fun serialize(encoder: Encoder, value: WrappedCQMessageChainList) {
-            return MessageDTO.serializer().list.serialize(encoder, value.value)
+            return ListSerializer(MessageDTO.serializer()).serialize(encoder, value.value)
         }
     }
 }

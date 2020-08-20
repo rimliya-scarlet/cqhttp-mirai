@@ -25,21 +25,24 @@ package tech.mihoyo.mirai.util
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.content
+import kotlinx.serialization.json.*
 import net.mamoe.mirai.Bot
 import net.mamoe.mirai.contact.Contact
+import net.mamoe.mirai.contact.Group
 import net.mamoe.mirai.getGroupOrNull
 import net.mamoe.mirai.message.data.*
 import net.mamoe.mirai.message.uploadImage
+import net.mamoe.mirai.utils.MiraiExperimentalAPI
+import net.mamoe.mirai.utils.currentTimeMillis
+import tech.mihoyo.mirai.PluginBase
+import tech.mihoyo.mirai.PluginBase.saveImageAsync
+import tech.mihoyo.mirai.PluginBase.saveRecordAsync
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.net.URL
+import java.security.MessageDigest
 import java.util.*
 import kotlin.collections.HashMap
-
 
 suspend fun cqMessageToMessageChains(
     bot: Bot,
@@ -60,8 +63,8 @@ suspend fun cqMessageToMessageChains(
             for (msg in cqMessage) {
                 try {
                     val data = msg.jsonObject["data"]
-                    when (msg.jsonObject["type"]?.content) {
-                        "text" -> messageChain += PlainText(data!!.jsonObject["text"]!!.content)
+                    when (msg.jsonObject["type"]?.jsonPrimitive?.content) {
+                        "text" -> messageChain += PlainText(data!!.jsonObject["text"]!!.jsonPrimitive.content)
                         else -> messageChain += cqTextToMessageInternal(bot, contact, msg)
                     }
                 } catch (e: NullPointerException) {
@@ -74,8 +77,8 @@ suspend fun cqMessageToMessageChains(
         is JsonObject -> {
             return try {
                 val data = cqMessage.jsonObject["data"]
-                when (cqMessage.jsonObject["type"]?.content) {
-                    "text" -> PlainText(data!!.jsonObject["text"]!!.content).asMessageChain()
+                when (cqMessage.jsonObject["type"]?.jsonPrimitive?.content) {
+                    "text" -> PlainText(data!!.jsonObject["text"]!!.jsonPrimitive.content).asMessageChain()
                     else -> cqTextToMessageInternal(bot, contact, cqMessage).asMessageChain()
                 }
             } catch (e: NullPointerException) {
@@ -102,7 +105,7 @@ private suspend fun cqTextToMessageInternal(bot: Bot, contact: Contact?, message
     return when (message) {
         is String -> {
             if (message.startsWith("[CQ:") && message.endsWith("]")) {
-                val parts = message.substring(4, message.length - 1).split(delimiters = *arrayOf(","), limit = 2)
+                val parts = message.substring(4, message.length - 1).split(delimiters = arrayOf(","), limit = 2)
 
                 lateinit var args: HashMap<String, String>
                 args = if (parts.size == 2) {
@@ -115,9 +118,9 @@ private suspend fun cqTextToMessageInternal(bot: Bot, contact: Contact?, message
             return PlainText(message.unescape())
         }
         is JsonObject -> {
-            val type = message.jsonObject["type"]!!.content
+            val type = message.jsonObject["type"]!!.jsonPrimitive.content
             val data = message.jsonObject["data"] ?: return MSG_EMPTY
-            val args = data.jsonObject.keys.map { it to data.jsonObject[it]!!.content }.toMap()
+            val args = data.jsonObject.keys.map { it to data.jsonObject[it]!!.jsonPrimitive.content }.toMap()
             return convertToMiraiMessage(bot, contact, type, args)
         }
         else -> MSG_EMPTY
@@ -135,14 +138,8 @@ private suspend fun convertToMiraiMessage(
             if (args["qq"] == "all") {
                 return AtAll
             } else {
-                val group = bot.getGroupOrNull(contact!!.id)
-                if (group == null) {
-                    return MSG_EMPTY
-                }
-                val member = group.getOrNull(args["qq"]!!.toLong())
-                if (member == null) {
-                    return MSG_EMPTY
-                }
+                val group = bot.getGroupOrNull(contact!!.id) ?: return MSG_EMPTY
+                val member = group.getOrNull(args["qq"]!!.toLong()) ?: return MSG_EMPTY
                 return At(member)
             }
         }
@@ -153,64 +150,7 @@ private suspend fun convertToMiraiMessage(
             return PlainText(String(Character.toChars(args["id"]!!.toInt())))
         }
         "image" -> {
-            var image: Image? = null
-            if (args.containsKey("file")) {
-                with(args["file"]!!) {
-                    when {
-                        startsWith("base64://") -> {
-                            val imageBytes = Base64.getDecoder().decode(args["file"]!!.replace("base64://", ""))
-                            val bis = ByteArrayInputStream(imageBytes)
-                            image = withContext(Dispatchers.IO) { contact!!.uploadImage(bis) }
-                        }
-                        startsWith("http") -> {
-                            image = try {
-                                withContext(Dispatchers.IO) { contact!!.uploadImage(URL(args["file"]!!)) }
-                            } catch (e: Exception) {
-                                null
-                            }
-                        }
-                        else -> {
-                            var fileIdOrPath = args["file"]!!
-                            if (fileIdOrPath.startsWith("file:///")) {
-                                fileIdOrPath = fileIdOrPath.replace("file:///", "")
-                                val file = File(fileIdOrPath).absoluteFile
-                                if (file.exists()) {
-                                    image = contact!!.uploadImage(file)
-                                }
-                            } else {
-                                if (fileIdOrPath.endsWith(".mnimg")) {
-                                    image = Image(fileIdOrPath.replace(".mnimg", ""))
-                                }
-                                val file = getDataFile("image", fileIdOrPath)
-                                if (file != null) {
-                                    image = contact!!.uploadImage(file)
-                                }
-                            }
-                            if (image == null) {
-                                if (args.containsKey("url")) {
-                                    image = withContext(Dispatchers.IO) { contact!!.uploadImage(URL(args["url"]!!)) }
-                                }
-                            }
-                        }
-
-                    }
-                }
-            } else if (args.containsKey("url")) {
-                image = withContext(Dispatchers.IO) { contact!!.uploadImage(URL(args["url"])) }
-            }
-            if (image != null) {
-                if (args["type"] == "flash") {
-                    return image!!.flash()
-                }
-                return image as Image
-            } else {
-                val imageUrl = when {
-                    args.containsKey("file") && args["file"]!!.startsWith("http") -> args["file"]
-                    args.containsKey("url") -> args["url"]
-                    else -> null
-                }
-                return PlainText("Bot发了一张图片, 但是插件获取不到, 它心累了不想尝试" + if (imageUrl != null) ", 并给出了原图链接: $imageUrl" else "")
-            }
+            return tryResolveMedia("image", contact, args)
         }
         "share" -> {
             return RichMessageHelper.share(
@@ -219,6 +159,9 @@ private suspend fun convertToMiraiMessage(
                 args["content"],
                 args["image"]
             )
+        }
+        "record" -> {
+            return tryResolveMedia("record", contact, args)
         }
         "contact" -> {
             return if (args["type"] == "qq") {
@@ -243,6 +186,20 @@ private suspend fun convertToMiraiMessage(
         "shake" -> {
             return PokeMessage.Poke
         }
+        "poke" -> {
+            PokeMessage.values.forEach {
+                if (it.type == args["type"]!!.toInt() && it.id == args["id"]!!.toInt()) {
+                    return it
+                }
+            }
+            return MSG_EMPTY
+        }
+        "xml" -> {
+            return XmlMessage(args["data"]!!)
+        }
+        "json" -> {
+            return JsonMessage(args["data"]!!)
+        }
         else -> {
             logger.debug("不支持的 CQ码：${type}")
         }
@@ -253,29 +210,45 @@ private suspend fun convertToMiraiMessage(
 
 private val MSG_EMPTY = PlainText("")
 
-private fun String.escape(c: Boolean = false): String {
-    var s = replace("&", "&amp;")
+private fun String.escape(): String {
+    return replace("&", "&amp;")
         .replace("[", "&#91;")
         .replace("]", "&#93;")
-    if (c) {
-        s = s.replace(",", "&#44;")
-    }
-    return s
+        .replace(",", "&#44;")
 }
 
 private fun String.unescape(): String {
     return replace("&amp;", "&")
         .replace("&#91;", "[")
         .replace("&#93;", "]")
+        .replace("&#44;", ",")
 }
 
 private fun String.toMap(): HashMap<String, String> {
     val map = HashMap<String, String>()
     split(",").forEach {
         val parts = it.split(delimiters = *arrayOf("="), limit = 2)
-        map[parts[0]] = parts[1].escape(true)
+        map[parts[0].trim()] = parts[1].unescape()
     }
     return map
+}
+
+@OptIn(MiraiExperimentalAPI::class, ExperimentalUnsignedTypes::class)
+suspend fun Message.toCQString(): String {
+    return when (this) {
+        is PlainText -> content.escape()
+        is At -> "[CQ:at,qq=$target]"
+        is Face -> "[CQ:face,id=$id]"
+        is VipFace -> "[CQ:vipface,id=${kind.id},name=${kind.name},count=${count}]"
+        is PokeMessage -> "[CQ:poke,id=${id},type=${type},name=${name}]"
+        is AtAll -> "[CQ:at,qq=all]"
+        is Image -> "[CQ:image,file=${md5.toUHexString("")},url=${queryUrl().escape()}]"
+        is RichMessage -> "[CQ:rich,data=${content.escape()}]"
+        is MessageSource -> ""
+        is QuoteReply -> ""
+        is Voice -> "[CQ:record,url=${url?.escape()},file=${md5.toUHexString("")}]"
+        else -> "此处消息的转义尚未被插件支持"
+    }
 }
 
 suspend fun codeToChain(bot: Bot, message: String, contact: Contact?): MessageChain {
@@ -327,6 +300,7 @@ suspend fun codeToChain(bot: Bot, message: String, contact: Contact?): MessageCh
 
 fun getDataFile(type: String, name: String): File? {
     arrayOf(
+        File(PluginBase.dataFolder, type).absolutePath + File.separatorChar,
         "data" + File.separatorChar + type + File.separatorChar,
         System.getProperty("java.library.path")
             .substringBefore(";") + File.separatorChar + "data" + File.separatorChar + type + File.separatorChar,
@@ -338,4 +312,231 @@ fun getDataFile(type: String, name: String): File? {
         }
     }
     return null
+}
+
+suspend fun tryResolveMedia(type: String, contact: Contact?, args: Map<String, String>): Message {
+    var media: Message? = null
+    var mediaBytes: ByteArray? = null
+    var mediaUrl: String? = null
+
+    withContext(Dispatchers.IO) {
+        if (args.containsKey("file")) {
+            with(args["file"]!!) {
+                when {
+                    startsWith("base64://") -> {
+                        mediaBytes = Base64.getDecoder().decode(args["file"]!!.replace("base64://", ""))
+                    }
+                    startsWith("http") -> {
+                        mediaUrl = args["file"]
+                    }
+                    else -> {
+                        val filePath = args["file"]!!
+                        if (filePath.startsWith("file:///")) {
+                            var fileUri = URL(args["file"]).toURI()
+                            if (fileUri.authority != null && fileUri.authority.isNotEmpty()) {
+                                fileUri = URL("file://" + args["file"]!!.substring("file:".length)).toURI()
+                            }
+                            val file = File(fileUri).absoluteFile
+                            if (file.exists() && file.canRead()) {
+                                mediaBytes = file.readBytes()
+                            }
+                        } else {
+                            if (type == "image") {
+                                media = tryResolveCachedImage(filePath, contact)
+                            } else if (type == "record") {
+                                media = tryResolveCachedRecord(filePath, contact)
+                            }
+                            if (media == null) {
+                                val file = getDataFile(type, filePath)
+                                if (file != null && file.canRead()) {
+                                    mediaBytes = file.readBytes()
+                                }
+                            }
+                        }
+                        if (mediaBytes == null) {
+                            if (args.containsKey("url")) {
+                                mediaUrl = args["url"]!!
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (args.containsKey("url")) {
+            mediaUrl = args["url"]!!
+        }
+
+        if (mediaBytes == null && mediaUrl != null) {
+            var useCache = true
+            if (args.containsKey("cache")) {
+                try {
+                    useCache = args["cache"]?.toIntOrNull() != 0
+                } catch (e: Exception) {
+                    logger.debug(e.message)
+                }
+            }
+
+            val urlHash = md5(mediaUrl!!).toUHexString("")
+
+            when (type) {
+                "image" -> {
+                    if (useCache) {
+                        media = tryResolveCachedImage(urlHash, contact)
+                    }
+
+                    if (media == null || !useCache) {
+                        mediaBytes = HttpClient.getBytes(mediaUrl!!)
+
+                        val bis = ByteArrayInputStream(mediaBytes)
+                        media = contact!!.uploadImage(bis)
+
+                        if (useCache) {
+                            val imageMD5 = mediaBytes?.let { md5(it) }?.toUHexString("")
+                            if (imageMD5 != null) {
+                                val cqImgContent = """
+                                    [image]
+                                    md5=$imageMD5
+                                    size=${mediaBytes?.size ?: 0}
+                                    url=https://gchat.qpic.cn/gchatpic_new/${contact.bot.id}/0-00-$imageMD5/0?term=2
+                                    addtime=$currentTimeMillis
+                                    """.trimIndent()
+                                logger.info("此链接图片将缓存为$urlHash.cqimg")
+                                saveImageAsync("$urlHash.cqimg", cqImgContent).start()
+                            }
+                        }
+                    }
+                }
+                "record" -> {
+                    if (useCache) {
+                        media = tryResolveCachedRecord(urlHash, contact)
+                    }
+                    if (media == null || !useCache) {
+                        mediaBytes = HttpClient.getBytes(mediaUrl!!)
+                        media = HttpClient.getInputStream(mediaUrl!!)
+                            .let { stream ->
+                                contact?.let { (it as Group).uploadVoice(stream) }
+                            }
+
+                        if (useCache && mediaBytes != null) {
+                            saveRecordAsync("$urlHash.cqrecord", mediaBytes!!).start()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (media != null) {
+        return media as Message
+    } else if (mediaBytes != null) {
+        when (type) {
+            "image" -> {
+                val bis = ByteArrayInputStream(mediaBytes)
+                media = withContext(Dispatchers.IO) { contact!!.uploadImage(bis) }
+                return media as Image
+            }
+            "record" -> {
+                media = withContext(Dispatchers.IO) { (contact!! as Group).uploadVoice(mediaBytes!!.inputStream()) }
+                return media as Voice
+            }
+        }
+    }
+    return PlainText("插件无法获取到媒体" + if (mediaUrl != null) ", 媒体链接: $mediaUrl" else "")
+}
+
+suspend fun tryResolveCachedRecord(name: String, contact: Contact?): Voice? {
+    val cacheFile = getDataFile("record", "$name.cqrecord")
+    if (cacheFile != null) {
+        if (cacheFile.canRead()) {
+            logger.info("此语音已缓存, 如需删除缓存请至 ${cacheFile.absolutePath}")
+            return contact?.let { (it as Group).uploadVoice(cacheFile.inputStream()) }
+        }
+    }
+    return null
+}
+
+suspend fun tryResolveCachedImage(name: String, contact: Contact?): Image? {
+    var image: Image? = null
+    val cacheFile = getDataFile("image", "$name.cqimg")
+    if (cacheFile != null) {
+        if (cacheFile.canRead()) {
+            logger.info("此链接图片已缓存, 如需删除缓存请至 ${cacheFile.absolutePath}")
+            var md5 = ""
+            var size = 0
+            var addTime = 0L
+
+            val cacheMediaContent = cacheFile.readLines()
+            cacheMediaContent.forEach {
+                val parts = it.trim().split("=", limit = 2)
+                if (parts.size == 2) {
+                    when (parts[0]) {
+                        "md5" -> md5 = parts[1]
+                        "size" -> size = parts[1].toIntOrNull() ?: 0
+                        "addtime" -> addTime = parts[1].toLongOrNull() ?: 0L
+                    }
+                }
+            }
+
+            if (md5 != "" && size != 0) {
+                if (contact != null) {
+                    // If add time till now more than one day, check if the image exists
+                    if (addTime - currentTimeMillis >= 1000 * 60 * 60 * 24) {
+                        if (ImgUtil.tryGroupPicUp(
+                                contact.bot,
+                                contact.id,
+                                md5,
+                                size
+                            ) != ImgUtil.ImageState.FileExist
+                        ) {
+                            cacheFile.delete()
+                        } else { // If file exists
+                            image = Image(ImgUtil.md5ToImageId(md5, contact))
+                            val cqImgContent = """
+                                                [image]
+                                                md5=$md5
+                                                size=$size
+                                                url=https://gchat.qpic.cn/gchatpic_new/${contact.bot.id}/0-00-$md5/0?term=2
+                                                addtime=$currentTimeMillis
+                                            """.trimIndent()
+                            saveImageAsync("$name.cqimg", cqImgContent).start() // Update cache file
+                        }
+                    } else { // If time < one day
+                        image = Image(ImgUtil.md5ToImageId(md5, contact))
+                    }
+                }
+            } else { // If cache file corrupted
+                cacheFile.delete()
+            }
+        } else {
+            logger.error("Image $name cache file cannot read.")
+        }
+    }
+    return image
+}
+
+fun md5(data: ByteArray): ByteArray {
+    return MessageDigest.getInstance("MD5").digest(data)
+}
+
+fun md5(str: String): ByteArray = md5(str.toByteArray())
+
+@ExperimentalUnsignedTypes
+internal fun ByteArray.toUHexString(
+    separator: String = " ",
+    offset: Int = 0,
+    length: Int = this.size - offset
+): String {
+    if (length == 0) {
+        return ""
+    }
+    val lastIndex = offset + length
+    return buildString(length * 2) {
+        this@toUHexString.forEachIndexed { index, it ->
+            if (index in offset until lastIndex) {
+                var ret = it.toUByte().toString(16).toUpperCase()
+                if (ret.length == 1) ret = "0$ret"
+                append(ret)
+                if (index < lastIndex - 1) append(separator)
+            }
+        }
+    }
 }
